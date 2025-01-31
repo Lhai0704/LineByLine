@@ -1,13 +1,11 @@
 const { app, BrowserWindow, ipcMain, dialog } = require('electron');
 const path = require('path');
 const fs = require('fs');
-const db = require('./database');
-// const fetch = require('node-fetch');
+const { getTranslation, saveTranslation } = require('./database');
 const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
 
-const TRANSLATOR_API_KEY = ''
+const TRANSLATOR_API_KEY = '';
 const TRANSLATOR_URL = 'http://localhost:3000/translate'; // 修改为本地服务器地址
-
 
 function createWindow() {
   const win = new BrowserWindow({
@@ -28,9 +26,7 @@ app.whenReady().then(createWindow);
 ipcMain.handle('select-file', async () => {
   const result = await dialog.showOpenDialog({
     properties: ['openFile'],
-    filters: [
-      { name: 'Text Files', extensions: ['txt'] }
-    ]
+    filters: [{ name: 'Text Files', extensions: ['txt'] }]
   });
 
   if (!result.canceled) {
@@ -43,31 +39,32 @@ ipcMain.handle('select-file', async () => {
 
 // 读取译文
 ipcMain.handle('get-translation', async (event, text) => {
-    try {
-      return await getTranslation(text);
-    } catch (err) {
-      console.error('Translation query error:', err);
-      return null;
-    }
-  });
+  try {
+    return await getTranslation(text);
+  } catch (err) {
+    console.error('Translation query error:', err);
+    return null;
+  }
+});
 
 // 存储译文
 ipcMain.handle('save-translation', async (event, original, translated) => {
-    try {
-      await saveTranslation(original, translated);
-    } catch (err) {
-      console.error('Translation save error:', err);
-    }
-  });
+  try {
+    await saveTranslation(original, translated);
+  } catch (err) {
+    console.error('Translation save error:', err);
+  }
+});
 
 // 翻译文本
 ipcMain.handle('translate-text', async (event, text) => {
+  try {
     // 先查询数据库，看看是否已有翻译
-    // const existingTranslation = db.prepare('SELECT translated FROM translations WHERE original = ?').get(text);
-    // if (existingTranslation) {
-    //   return existingTranslation.translated;
-    // }
-  
+    const existingTranslation = await getTranslation(text);
+    if (existingTranslation) {
+      return existingTranslation;
+    }
+
     // 如果没有，调用翻译 API
     const response = await fetch(TRANSLATOR_URL, {
       method: 'POST',
@@ -77,12 +74,16 @@ ipcMain.handle('translate-text', async (event, text) => {
       },
       body: JSON.stringify([{ text }]),
     });
-  
+
     const data = await response.json();
     const translatedText = data[0]?.translations[0]?.text || '';
-  
+
     // 存入数据库
-    // db.prepare('INSERT INTO translations (original, translated) VALUES (?, ?)').run(text, translatedText);
-  
+    await saveTranslation(text, translatedText);
+
     return translatedText;
-  });
+  } catch (err) {
+    console.error('Translation error:', err);
+    return '';
+  }
+});
