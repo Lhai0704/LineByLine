@@ -28,7 +28,7 @@ function App() {
             }
 
             const text = fileContent.join(' ').replace(/\n/g, ' '); // 合并所有行，并替换换行符为空格
-            
+
             const sentenceEndRegex = new RegExp(
                 `(?<!${TITLES.join('|')}\\s?)` +  // 确保不在尊称之后（允许尊称后有空格）
                 `(?<=[。！？.!?])\\s+`,             // 句子结束标点后的空格
