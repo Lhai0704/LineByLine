@@ -4,18 +4,16 @@ const EPub = require('epub');
 
 class FileHandler {
     constructor() {
-        this.pdfjsLib = null;    
+        this.pdfjsLib = null;
     }
 
-    // 初始化 PDF.js
     async initPdfLib() {
         if (!this.pdfjsLib) {
             // 动态导入 pdf.js
             const pdfjs = await import('pdfjs-dist/build/pdf.mjs');
             this.pdfjsLib = pdfjs;
-            // 设置 worker
-            const pdfWorker = await import('pdfjs-dist/build/pdf.worker.mjs');
-            this.pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorker;
+
+            this.pdfjsLib.GlobalWorkerOptions.workerSrc = '../../../resources/pdf.worker.mjs';
         }
         return this.pdfjsLib;
     }
@@ -35,45 +33,123 @@ class FileHandler {
     // 读取文本文件
     async readTxt(filePath) {
         const content = await fs.readFile(filePath, 'utf8');
-        return {
-            content: content.split('\n'),
-            images: []
-        };
+        return content.split('\n').map(line => ({
+            type: 'text',
+            content: line.trim(),
+            position: {}
+        }));
+    }
+    
+
+    async readPdf(filePath) {
+        const pdfjsLib = await this.initPdfLib();
+        const data = await fs.readFile(filePath);
+        const pdf = await pdfjsLib.getDocument(new Uint8Array(data)).promise;
+        
+        // 用于存储所有内容（文本和图片）的数组
+        const contentItems = [];
+        
+        for (let i = 1; i <= pdf.numPages; i++) {
+            const page = await pdf.getPage(i);
+            
+            // 获取页面中的所有内容（文本和图片）
+            const operatorList = await page.getOperatorList();
+            const textContent = await page.getTextContent();
+            
+            let currentTextIndex = 0;
+            const textItems = textContent.items;
+            
+            // 遍历页面操作列表，按顺序处理文本和图片
+            for (let j = 0; j < operatorList.fnArray.length; j++) {
+                const fn = operatorList.fnArray[j];
+                
+                // 处理文本
+                if (fn === pdfjsLib.OPS.showText) {
+                    if (currentTextIndex < textItems.length) {
+                        const textItem = textItems[currentTextIndex];
+                        contentItems.push({
+                            type: 'text',
+                            content: textItem.str.trim(),
+                            position: {
+                                page: i,
+                                y: textItem.transform[5] // y坐标
+                            }
+                        });
+                        currentTextIndex++;
+                    }
+                }
+                // 处理图片
+                else if (fn === pdfjsLib.OPS.paintImageXObject) {
+                    const imageArgs = operatorList.argsArray[j];
+                    const imageId = imageArgs[0];
+                    try {
+                        const image = await this.getPdfImage(page.objs, imageId);
+                        if (image) {
+                            contentItems.push({
+                                type: 'image',
+                                data: image.data,
+                                width: image.width,
+                                height: image.height,
+                                position: {
+                                    page: i,
+                                    y: operatorList.argsArray[j-1]?.[5] || 0 // 尝试获取图片的y坐标
+                                }
+                            });
+                        }
+                    } catch (error) {
+                        console.error('Error extracting image:', error);
+                    }
+                }
+            }
+        }
+        
+        // 按页码和位置排序
+        contentItems.sort((a, b) => {
+            if (a.position.page !== b.position.page) {
+                return a.position.page - b.position.page;
+            }
+            return b.position.y - a.position.y; // PDF坐标系是从底部向上的
+        });
+        
+        return contentItems;
     }
 
-    // 读取EPUB文件
     async readEpub(filePath) {
         return new Promise((resolve, reject) => {
             const epub = new EPub(filePath);
-            const result = {
-                content: [],
-                images: []
-            };
+            const contentItems = [];
 
             epub.on('end', async () => {
                 try {
-                    // 获取章节内容
                     for (const chapter of epub.flow) {
-                        const text = await this.getEpubChapter(epub, chapter);
-                        if (text) result.content.push(text);
-                    }
-
-                    // 获取图片
-                    for (const item of epub.flow) {
-                        if (item.mediaType && item.mediaType.startsWith('image/')) {
-                            const imageData = await this.getEpubImage(epub, item);
+                        if (chapter.mediaType && chapter.mediaType.startsWith('image/')) {
+                            // 处理图片
+                            const imageData = await this.getEpubImage(epub, chapter);
                             if (imageData) {
-                                result.images.push({
-                                    id: item.id,
-                                    type: item.mediaType,
-                                    data: imageData,
-                                    chapter: item.chapter
+                                contentItems.push({
+                                    type: 'image',
+                                    data: imageData.data.toString('base64'),  // 转成 base64
+                                    mediaType: imageData.mimeType,  // 保留 mimeType
+                                    position: chapter.index
+                                });
+                            }
+                        } else {
+                            // 处理文本
+                            const text = await this.getEpubChapter(epub, chapter);
+                            if (text) {
+                                contentItems.push({
+                                    type: 'text',
+                                    content: text,
+                                    position: chapter.index
                                 });
                             }
                         }
                     }
-
-                    resolve(result);
+                    
+                    // 按位置排序
+                    contentItems.sort((a, b) => a.position - b.position);
+                    
+                    resolve(contentItems);
                 } catch (error) {
                     reject(error);
                 }
@@ -83,7 +159,7 @@ class FileHandler {
             epub.parse();
         });
     }
-
+    
     // 获取EPUB章节内容
     getEpubChapter(epub, chapter) {
         return new Promise((resolve, reject) => {
@@ -104,46 +180,20 @@ class FileHandler {
     getEpubImage(epub, item) {
         return new Promise((resolve, reject) => {
             epub.getImage(item.id, (error, data, mimeType) => {
-                if (error) reject(error);
-                else resolve(data);
+                if (error) {
+                    reject(error);
+                } else {
+                    resolve({ data, mimeType });  // 返回完整信息
+                }
             });
         });
     }
 
-    // 读取PDF文件
-    async readPdf(filePath) {
-        const pdfjsLib = await this.initPdfLib();
-        const data = await fs.readFile(filePath);
-        const pdf = await pdfjsLib.getDocument(new Uint8Array(data)).promise;
-        const result = {
-            content: [],
-            images: []
-        };
-
-        // 获取文本内容
-        for (let i = 1; i <= pdf.numPages; i++) {
-            const page = await pdf.getPage(i);
-            const textContent = await page.getTextContent();
-            const pageText = textContent.items
-                .map(item => item.str)
-                .join(' ')
-                .trim();
-            
-            if (pageText) {
-                result.content.push(pageText);
-            }
-
-            // 提取图片
-            const images = await this.extractPdfPageImages(page, i);
-            result.images.push(...images);
-        }
-
-        return result;
-    }
-
+    
 
     // 提取PDF页面中的图片
     async extractPdfPageImages(page, pageNum) {
+        const pdfjsLib = await this.initPdfLib();
         const images = [];
         const ops = await page.getOperatorList();
         const commonObjs = page.commonObjs;

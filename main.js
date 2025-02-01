@@ -1,7 +1,9 @@
 const { app, BrowserWindow, ipcMain, dialog } = require('electron');
 const path = require('path');
 const fs = require('fs');
-const { getTranslation, saveTranslation } = require('./database');
+// const { getTranslation, saveTranslation } = require('./database');
+const Database = require('./database');
+const FileHandler = require('./fileHandlers');
 const fetch = (...args) => import('node-fetch').then(({ default: fetch }) => fetch(...args));
 
 const TRANSLATOR_API_KEY = '';
@@ -27,87 +29,43 @@ ipcMain.handle('select-file', async () => {
     const result = await dialog.showOpenDialog({
         properties: ['openFile'],
         filters: [
-            { name: 'Text Files', extensions: ['txt'] },
-            { name: 'EPUB Files', extensions: ['epub'] },
-            { name: 'PDF Files', extensions: ['pdf'] },
-        ],
+            { name: 'Supported Files', extensions: ['txt', 'epub', 'pdf'] }
+        ]
     });
 
     if (!result.canceled) {
         const filePath = result.filePaths[0];
-        const fileExt = path.extname(filePath).toLowerCase();
+        const fileInfo = await FileHandler.getFileInfo(filePath);
+        
+        // 添加书籍到数据库
+        const bookId = await Database.addBook(
+            filePath,
+            fileInfo.name,
+            fileInfo.format
+        );
 
-        let content = [];
-
-        // 读取 txt 文件
-        if (fileExt === '.txt') {
-            content = fs.readFileSync(filePath, 'utf8').split('\n');
-            return content;
+        // 根据文件格式读取内容
+        let contentItems;
+        switch (fileInfo.format) {
+            case 'txt':
+                contentItems = await FileHandler.readTxt(filePath);
+                break;
+            case 'epub':
+                contentItems = await FileHandler.readEpub(filePath);
+                break;
+            case 'pdf':
+                contentItems = await FileHandler.readPdf(filePath);
+                break;
         }
 
-        // 读取 epub 文件
-        else if (fileExt === '.epub') {
-            const EPub = require('epub');
-
-            return new Promise((resolve, reject) => {
-                const epub = new EPub(filePath, '/images/', '/chapters/');
-
-                epub.on('end', async () => {
-                    try {
-                        // 获取所有章节内容
-                        const chapters = [];
-
-                        // 使用 Promise.all 和 map 来并行处理所有章节
-                        const chapterPromises = epub.flow.map(chapter => {
-                            return new Promise((resolveChapter, rejectChapter) => {
-                                epub.getChapter(chapter.id, (error, text) => {
-                                    if (error) {
-                                        rejectChapter(error);
-                                    } else {
-                                        // 将 HTML 转换为纯文本
-                                        const textContent = text.replace(/<[^>]+>/g, '')
-                                            .replace(/\n\s*\n/g, '\n')
-                                            .trim();
-                                        resolveChapter(textContent);
-                                    }
-                                });
-                            });
-                        });
-
-                        const chapterContents = await Promise.all(chapterPromises);
-                        resolve(chapterContents);
-                    } catch (error) {
-                        reject(error);
-                    }
-                });
-
-                epub.on('error', error => {
-                    reject(error);
-                });
-
-                epub.parse();
-            });
-        }
-
-        // 读取 pdf 文件
-        else if (fileExt === '.pdf') {
-            const pdfjsLib = await import('pdfjs-dist/build/pdf.mjs');
-            const pdf = await pdfjsLib.getDocument(filePath).promise;
-            const numPages = pdf.numPages;
-            const textContent = [];
-
-            for (let pageNum = 1; pageNum <= numPages; pageNum++) {
-                const page = await pdf.getPage(pageNum);
-                const content = await page.getTextContent();
-                const pageText = content.items.map((item) => item.str).join(' ');
-                textContent.push(pageText);
-            }
-
-            content = textContent;
-            return content;
-        }
+        return {
+            bookId,
+            contentItems
+            // content: fileData.content,
+            // images: fileData.images
+        };
     }
-    return [];
+    return null;
 });
 
 
@@ -131,12 +89,16 @@ ipcMain.handle('save-translation', async (event, original, translated) => {
 });
 
 // 翻译文本
-ipcMain.handle('translate-text', async (event, text) => {
+ipcMain.handle('translate-text', async (event, { bookId, sentenceIndex, text }) => {
     try {
-        // 先查询数据库，看看是否已有翻译
-        const existingTranslation = await getTranslation(text);
-        if (existingTranslation) {
-            return existingTranslation;
+        // 先查询数据库
+        const existingTranslation = await Database.getBookTranslations(bookId);
+        const savedTranslation = existingTranslation.find(t => 
+            t.sentence_index === sentenceIndex && t.original_text === text
+        );
+        
+        if (savedTranslation) {
+            return savedTranslation.translated_text;
         }
 
         // 如果没有，调用翻译 API
@@ -152,12 +114,28 @@ ipcMain.handle('translate-text', async (event, text) => {
         const data = await response.json();
         const translatedText = data[0]?.translations[0]?.text || '';
 
-        // 存入数据库
-        await saveTranslation(text, translatedText);
+        // 保存翻译到数据库
+        if (translatedText) {
+            await Database.saveTranslations(bookId, [{
+                sentence_index: sentenceIndex,
+                original: text,
+                translated: translatedText
+            }]);
+        }
 
         return translatedText;
     } catch (err) {
         console.error('Translation error:', err);
         return '';
+    }
+});
+
+// 获取书籍的所有翻译
+ipcMain.handle('get-book-translations', async (event, bookId) => {
+    try {
+        return await Database.getBookTranslations(bookId);
+    } catch (err) {
+        console.error('Error getting translations:', err);
+        return null;
     }
 });
